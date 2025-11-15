@@ -13,6 +13,8 @@ import torch.nn.functional as F
 
 from datasets import load_dataset
 import tiktoken
+from tqdm import tqdm
+
 
 ################################################################################
 # 1. Command-line arg parsing
@@ -234,14 +236,101 @@ class LSTMSeqModel(nn.Module):
 # 5. Our "stub" Transformer with KV-cache 
 #    Very slow Python loop for training. Multi-head sums head outputs.
 ################################################################################
-class Attention()
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
-        pass
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        x_norm = x / rms
+        return x_norm * self.weight
+
+class Attention(nn.Module):
+    def __init__(self, d_model=1024, n_heads=2, head_dim=128):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.q_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+    def forward(self, x, kv_cache=None, use_cache=False):
+        input_shape = x.shape[:-1]
+        hidden_shape = (*input_shape, self.n_heads, self.head_dim)
+
+        q = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(hidden_shape)).transpose(1, 2)
+        v = self.v_proj(x).view(hidden_shape).transpose(1, 2)
+
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+        new_cache = (k, v) if use_cache else None
+
+        T_q = q.size(2)
+        T_k = k.size(2)
+        device = x.device
+        scale = self.head_dim ** -0.5
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        cache_len = T_k - T_q
+        q_idx = torch.arange(T_q, device=device).unsqueeze(1) + cache_len
+        k_idx = torch.arange(T_k, device=device).unsqueeze(0)
+        causal_mask = k_idx > q_idx
+        causal_mask = causal_mask.view(1, 1, T_q, T_k)
+
+        attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+
+        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+
+        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, new_cache
+
+class MLP(nn.Module):
+    def __init__(self, hidden_size=1024, intermediate_size=4096):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.silu(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model=1024, n_heads=2, head_dim=128):
+        super().__init__()
+        self.input_layernorm = RMSNorm(d_model)
+        self.post_attention_layernorm = RMSNorm(d_model)
+        self.attn = Attention(d_model, n_heads, head_dim)
+        self.mlp = MLP(d_model, d_model * 4)
+
+    def forward(self, x, kv_cache=None, use_cache=False):
+        residual = x
+        x = self.input_layernorm(x)
+        x, new_cache = self.attn(x, kv_cache=kv_cache, use_cache=use_cache)
+        x = x + residual
+
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = x + residual
+        return x, new_cache
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, head_dim=128, block_size=1024):
         super().__init__()
         
         self.vocab_size = vocab_size
@@ -249,12 +338,35 @@ class TransformerModel(nn.Module):
         self.n_heads = n_heads
         self.n_blocks = n_blocks
         
-        self.embed = nn.Embedding(num_embeddings = vocab_size,embedding_dim = d_model,)
-        self.attention = 
-        self.rmsnorm = RMSNorm()
-    def forward(self,x):
-            
-        pass
+        self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+        self.pos_embed = nn.Embedding(num_embeddings=block_size, embedding_dim=d_model)
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(d_model=d_model, n_heads=n_heads, head_dim=head_dim)
+             for _ in range(n_blocks)]
+        )
+        self.rmsnorm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+    def forward(self, x, kv_caches=None, use_cache=False):
+        # x: (seq_len, batch)
+        x = x.transpose(0, 1) # (batch, seq_len)
+        pos_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+
+        x = self.embed(x) + self.pos_embed(pos_ids)
+
+        if kv_caches is None:
+            kv_caches = [None] * self.n_blocks
+        new_kv_caches = []
+
+        for i, block in enumerate(self.blocks):
+            x, new_cache = block(x, kv_cache=kv_caches[i], use_cache=use_cache)
+            new_kv_caches.append(new_cache)
+
+        x = self.rmsnorm(x)
+        logits = self.lm_head(x)
+
+        # (batch, seq_len, vocab_size) => (seq_len, batch, vocab_size)
+        logits = logits.transpose(0, 1)
+        return logits
 
 
 ################################################################################
@@ -356,7 +468,7 @@ def train_one_model(model,
     next_sample_time = start_time
     global_step = 0
 
-    for epoch in range(1, epochs + 1):
+    for epoch in tqdm(range(1, epochs + 1), leave=False):
         model.train()
         total_loss = 0.0
         partial_loss = 0.0
@@ -545,12 +657,18 @@ def main():
     ).to(device)
 
     transformer = TransformerModel(
+        vocab_size=vocab_size,
+        d_model=embed_size,
+        n_heads=4,
+        n_blocks=4,
+        head_dim=128,
+        block_size=block_size
     ).to(device)
 
     models = {
-      # "kgram_mlp_seq": kgram_model,
-        "lstm_seq": lstm_model,
-      # "kvcache_transformer": kv_transformer,
+        # "kgram_mlp_seq": kgram_model,
+        # "lstm_seq": lstm_model,
+        "kvcache_transformer": transformer,
     }
 
 
