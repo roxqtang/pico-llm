@@ -383,7 +383,46 @@ def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5)
 ################################################################################
 
 def nucleus_sampling(logits, p=0.95):
-    return torch.argmax(logits).item()
+    """
+    Top-p (nucleus) sampling implementation.
+    
+    Args:
+        logits: 1D tensor of logits (vocab_size,)
+        p: probability threshold (default 0.95)
+    
+    Returns:
+        int: sampled token id
+    
+    Algorithm:
+    1. Sort tokens by probability in descending order
+    2. Find smallest k such that sum(p(1)...p(k)) >= p
+    3. Sample from the truncated distribution of top k tokens
+    """
+    # Step 1: Convert logits to probabilities using softmax
+    probs = F.softmax(logits, dim=-1)
+    
+    # Step 2: Sort probabilities in descending order
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    
+    # Step 3: Compute cumulative probabilities
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    
+    # Step 4: Find the cutoff point k
+    mask = cumulative_probs <= p
+    mask[0] = True  # Always keep at least the first token
+    
+    # Step 5: Truncate the distribution
+    truncated_probs = sorted_probs[mask]
+    truncated_indices = sorted_indices[mask]
+    
+    # Step 6: Renormalize the truncated probabilities
+    truncated_probs = truncated_probs / truncated_probs.sum()
+    
+    # Step 7: Sample from the truncated distribution
+    sampled_idx = torch.multinomial(truncated_probs, num_samples=1).item()
+    chosen_token = truncated_indices[sampled_idx].item()
+    
+    return chosen_token
 
 
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
@@ -542,7 +581,6 @@ def train_one_model(model,
 
         avg_loss = total_loss / step_in_epoch
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
-
 
 ################################################################################
 # 9. Main
