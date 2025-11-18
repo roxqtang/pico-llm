@@ -249,10 +249,11 @@ class RMSNorm(nn.Module):
         return x_norm * self.weight
 
 class Attention(nn.Module):
-    def __init__(self, d_model=1024, n_heads=2, head_dim=128):
+    def __init__(self, d_model=1024, n_heads=2, head_dim=128, normalization='sandwich'):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = head_dim
+        self.normalization = normalization
         self.q_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
@@ -264,8 +265,12 @@ class Attention(nn.Module):
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, self.n_heads, self.head_dim)
 
-        q = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(hidden_shape)).transpose(1, 2)
+        if self.normalization == 'sandwich':
+            q = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
+            k = self.k_norm(self.k_proj(x).view(hidden_shape)).transpose(1, 2)
+        else:
+            q = self.q_proj(x).view(hidden_shape).transpose(1, 2)
+            k = self.k_proj(x).view(hidden_shape).transpose(1, 2)
         v = self.v_proj(x).view(hidden_shape).transpose(1, 2)
 
         if kv_cache is not None:
@@ -313,8 +318,9 @@ class MLP(nn.Module):
         return down_proj
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model=1024, n_heads=2, head_dim=128):
+    def __init__(self, d_model=1024, n_heads=2, head_dim=128, normalization='sandwich'):
         super().__init__()
+        self.normalization = normalization
         self.input_layernorm = RMSNorm(d_model)
         self.post_attention_layernorm = RMSNorm(d_model)
         self.attn = Attention(d_model, n_heads, head_dim)
@@ -328,18 +334,19 @@ class TransformerBlock(nn.Module):
         output_attentions: bool = False,       # [E-added] 
     ):
         residual = x
-        x_norm = self.input_layernorm(x)
+        if self.normalization == 'pre' or self.normalization == 'sandwich':
+            x = self.input_layernorm(x)
 
         if output_attentions:                  # [E-added]
             x_attn, new_cache, attn_weights = self.attn(
-                x_norm,
+                x,
                 kv_cache=kv_cache,
                 use_cache=use_cache,
                 return_attn=True,             # [E-added]
             )
         else:
             x_attn, new_cache = self.attn(
-                x_norm,
+                x,
                 kv_cache=kv_cache,
                 use_cache=use_cache,
                 return_attn=False,            # [E-added]
@@ -347,11 +354,16 @@ class TransformerBlock(nn.Module):
             attn_weights = None               # [E-added]
 
         x = x_attn + residual
+        if self.normalization == 'post':
+            x = self.input_layernorm(x)
 
         residual = x
-        x_norm = self.post_attention_layernorm(x)
-        x_mlp = self.mlp(x_norm)
+        if self.normalization == 'pre' or self.normalization == 'sandwich':
+            x = self.post_attention_layernorm(x)
+        x_mlp = self.mlp(x)
         x = x_mlp + residual
+        if self.normalization == 'post':
+            x = self.post_attention_layernorm(x)
 
         if output_attentions:                  # [E-added]
             return x, new_cache, attn_weights
@@ -359,7 +371,7 @@ class TransformerBlock(nn.Module):
             return x, new_cache
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, head_dim=128, block_size=1024):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, head_dim=128, block_size=1024, normalization='sandwich'):
         super().__init__()
         
         self.vocab_size = vocab_size
@@ -370,7 +382,7 @@ class TransformerModel(nn.Module):
         self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
         self.pos_embed = nn.Embedding(num_embeddings=block_size, embedding_dim=d_model)
         self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model=d_model, n_heads=n_heads, head_dim=head_dim)
+            [TransformerBlock(d_model=d_model, n_heads=n_heads, head_dim=head_dim, normalization=normalization)
              for _ in range(n_blocks)]
         )
         self.rmsnorm = RMSNorm(d_model)
@@ -577,8 +589,21 @@ def train_one_model(model,
             logits = model(batch_tokens)  # (seq_len, batch, vocab_size)
             loss = compute_next_token_loss(logits, batch_tokens)
 
+            # logging loss
+            loss_dict[model_name].append(loss.item())
+
             optimizer.zero_grad()
             loss.backward()
+
+            # logging gradient
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            grad_dict[model_name].append(total_norm)
+
             optimizer.step()
 
             total_loss += loss.item()
@@ -649,7 +674,7 @@ def main():
 
     embed_size = args.embed_size
     batch_size = 16
-    num_epochs = 3
+    num_epochs = 5
     learning_rate = 1e-3
 
     block_size = args.block_size
@@ -748,19 +773,43 @@ def main():
         hidden_size=embed_size
     ).to(device)
 
-    transformer = TransformerModel(
+    transformer_pre_norm = TransformerModel(
         vocab_size=vocab_size,
         d_model=embed_size,
         n_heads=4,
         n_blocks=4,
         head_dim=128,
-        block_size=block_size
+        block_size=block_size,
+        normalization='pre'
+    ).to(device)
+
+    transformer_post_norm = TransformerModel(
+        vocab_size=vocab_size,
+        d_model=embed_size,
+        n_heads=4,
+        n_blocks=4,
+        head_dim=128,
+        block_size=block_size,
+        normalization='post'
+    ).to(device)
+
+    transformer_sandwich_norm = TransformerModel(
+        vocab_size=vocab_size,
+        d_model=embed_size,
+        n_heads=4,
+        n_blocks=4,
+        head_dim=128,
+        block_size=block_size,
+        normalization='sandwich'
     ).to(device)
 
     models = {
         # "kgram_mlp_seq": kgram_model,
         # "lstm_seq": lstm_model,
-        "kvcache_transformer": transformer,
+        # "kvcache_transformer": transformer,
+        "pre_norm": transformer_pre_norm,
+        "post_norm": transformer_post_norm,
+        "sandwich_norm": transformer_sandwich_norm
     }
 
 
@@ -824,4 +873,18 @@ def main():
 
 
 if __name__ == "__main__":
+    loss_dict = {
+        "pre_norm": [],
+        "post_norm": [],
+        "sandwich_norm": []
+    }
+    grad_dict = {
+        "pre_norm": [],
+        "post_norm": [],
+        "sandwich_norm": []
+    }
+
     main()
+
+    torch.save(loss_dict, "loss_dict.pt")
+    torch.save(grad_dict, "grad_dict.pt")
