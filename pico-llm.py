@@ -260,7 +260,7 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x, kv_cache=None, use_cache=False):
+    def forward(self, x, kv_cache=None, use_cache=False, return_attn: bool = False):
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, self.n_heads, self.head_dim)
 
@@ -293,7 +293,10 @@ class Attention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, new_cache
+        if return_attn:
+            return attn_output, new_cache, attn_weights
+        else:
+            return attn_output, new_cache
 
 class MLP(nn.Module):
     def __init__(self, hidden_size=1024, intermediate_size=4096):
@@ -317,17 +320,43 @@ class TransformerBlock(nn.Module):
         self.attn = Attention(d_model, n_heads, head_dim)
         self.mlp = MLP(d_model, d_model * 4)
 
-    def forward(self, x, kv_cache=None, use_cache=False):
+    def forward(
+        self,
+        x,
+        kv_cache=None,
+        use_cache: bool = False,
+        output_attentions: bool = False,       # [E-added] 
+    ):
         residual = x
-        x = self.input_layernorm(x)
-        x, new_cache = self.attn(x, kv_cache=kv_cache, use_cache=use_cache)
-        x = x + residual
+        x_norm = self.input_layernorm(x)
+
+        if output_attentions:                  # [E-added]
+            x_attn, new_cache, attn_weights = self.attn(
+                x_norm,
+                kv_cache=kv_cache,
+                use_cache=use_cache,
+                return_attn=True,             # [E-added]
+            )
+        else:
+            x_attn, new_cache = self.attn(
+                x_norm,
+                kv_cache=kv_cache,
+                use_cache=use_cache,
+                return_attn=False,            # [E-added]
+            )
+            attn_weights = None               # [E-added]
+
+        x = x_attn + residual
 
         residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
-        x = x + residual
-        return x, new_cache
+        x_norm = self.post_attention_layernorm(x)
+        x_mlp = self.mlp(x_norm)
+        x = x_mlp + residual
+
+        if output_attentions:                  # [E-added]
+            return x, new_cache, attn_weights
+        else:
+            return x, new_cache
 
 class TransformerModel(nn.Module):
     def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, head_dim=128, block_size=1024):
@@ -346,27 +375,52 @@ class TransformerModel(nn.Module):
         )
         self.rmsnorm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-    def forward(self, x, kv_caches=None, use_cache=False):
-        # x: (seq_len, batch)
-        x = x.transpose(0, 1) # (batch, seq_len)
-        pos_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
 
+    def forward(
+        self,
+        x,
+        kv_caches=None,
+        use_cache: bool = False,
+        output_attentions: bool = False,    # [E-added]
+    ):
+        # x: (seq_len, batch)
+        x = x.transpose(0, 1)
+        batch_size, seq_len = x.shape
+
+        pos_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)
         x = self.embed(x) + self.pos_embed(pos_ids)
 
         if kv_caches is None:
             kv_caches = [None] * self.n_blocks
         new_kv_caches = []
+        attn_list = []                      # [E-added]
 
         for i, block in enumerate(self.blocks):
-            x, new_cache = block(x, kv_cache=kv_caches[i], use_cache=use_cache)
+            if output_attentions:           # [E-added]
+                x, new_cache, attn_weights = block(
+                    x,
+                    kv_cache=kv_caches[i],
+                    use_cache=use_cache,
+                    output_attentions=True,
+                )
+                attn_list.append(attn_weights)
+            else:
+                x, new_cache = block(
+                    x,
+                    kv_cache=kv_caches[i],
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             new_kv_caches.append(new_cache)
 
         x = self.rmsnorm(x)
         logits = self.lm_head(x)
-
-        # (batch, seq_len, vocab_size) => (seq_len, batch, vocab_size)
         logits = logits.transpose(0, 1)
-        return logits
+
+        if output_attentions:               # [E-added]
+            return logits, attn_list
+        else:
+            return logits
 
 
 ################################################################################
@@ -729,6 +783,11 @@ def main():
             prompt=args.prompt  # <--- Pass the user-specified prompt here
         )
 
+        # ================== E-added: save transformer weights for visualization ==================
+        if model_name == "kvcache_transformer":
+            torch.save(model.state_dict(), "transformer.pt")
+            print("Saved checkpoint to transformer.pt")
+        # =========================================================================================
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
             # 1) Greedy
