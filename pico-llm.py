@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
@@ -52,6 +53,10 @@ def parse_args():
     # Newly added device argument:
     parser.add_argument("--device_id", type=str, default="cuda:0",
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
+
+    # TensorBoard run name for comparison experiments
+    parser.add_argument("--run_name", type=str, default="default",
+                        help="Name for this training run (used in TensorBoard directory). Default='default'.")
 
     args = parser.parse_args()
     return args
@@ -249,11 +254,10 @@ class RMSNorm(nn.Module):
         return x_norm * self.weight
 
 class Attention(nn.Module):
-    def __init__(self, d_model=1024, n_heads=2, head_dim=128, normalization='sandwich'):
+    def __init__(self, d_model=1024, n_heads=2, head_dim=128):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.normalization = normalization
         self.q_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, self.n_heads * self.head_dim, bias=False)
@@ -261,16 +265,12 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x, kv_cache=None, use_cache=False, return_attn: bool = False):
+    def forward(self, x, kv_cache=None, use_cache=False):
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, self.n_heads, self.head_dim)
 
-        if self.normalization == 'sandwich':
-            q = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
-            k = self.k_norm(self.k_proj(x).view(hidden_shape)).transpose(1, 2)
-        else:
-            q = self.q_proj(x).view(hidden_shape).transpose(1, 2)
-            k = self.k_proj(x).view(hidden_shape).transpose(1, 2)
+        q = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(hidden_shape)).transpose(1, 2)
         v = self.v_proj(x).view(hidden_shape).transpose(1, 2)
 
         if kv_cache is not None:
@@ -298,10 +298,7 @@ class Attention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        if return_attn:
-            return attn_output, new_cache, attn_weights
-        else:
-            return attn_output, new_cache
+        return attn_output, new_cache
 
 class MLP(nn.Module):
     def __init__(self, hidden_size=1024, intermediate_size=4096):
@@ -318,60 +315,27 @@ class MLP(nn.Module):
         return down_proj
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model=1024, n_heads=2, head_dim=128, normalization='sandwich'):
+    def __init__(self, d_model=1024, n_heads=2, head_dim=128):
         super().__init__()
-        self.normalization = normalization
         self.input_layernorm = RMSNorm(d_model)
         self.post_attention_layernorm = RMSNorm(d_model)
         self.attn = Attention(d_model, n_heads, head_dim)
         self.mlp = MLP(d_model, d_model * 4)
 
-    def forward(
-        self,
-        x,
-        kv_cache=None,
-        use_cache: bool = False,
-        output_attentions: bool = False,       # [E-added] 
-    ):
+    def forward(self, x, kv_cache=None, use_cache=False):
         residual = x
-        if self.normalization == 'pre' or self.normalization == 'sandwich':
-            x = self.input_layernorm(x)
-
-        if output_attentions:                  # [E-added]
-            x_attn, new_cache, attn_weights = self.attn(
-                x,
-                kv_cache=kv_cache,
-                use_cache=use_cache,
-                return_attn=True,             # [E-added]
-            )
-        else:
-            x_attn, new_cache = self.attn(
-                x,
-                kv_cache=kv_cache,
-                use_cache=use_cache,
-                return_attn=False,            # [E-added]
-            )
-            attn_weights = None               # [E-added]
-
-        x = x_attn + residual
-        if self.normalization == 'post':
-            x = self.input_layernorm(x)
+        x = self.input_layernorm(x)
+        x, new_cache = self.attn(x, kv_cache=kv_cache, use_cache=use_cache)
+        x = x + residual
 
         residual = x
-        if self.normalization == 'pre' or self.normalization == 'sandwich':
-            x = self.post_attention_layernorm(x)
-        x_mlp = self.mlp(x)
-        x = x_mlp + residual
-        if self.normalization == 'post':
-            x = self.post_attention_layernorm(x)
-
-        if output_attentions:                  # [E-added]
-            return x, new_cache, attn_weights
-        else:
-            return x, new_cache
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = x + residual
+        return x, new_cache
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, head_dim=128, block_size=1024, normalization='sandwich'):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, head_dim=128, block_size=1024):
         super().__init__()
         
         self.vocab_size = vocab_size
@@ -382,57 +346,32 @@ class TransformerModel(nn.Module):
         self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
         self.pos_embed = nn.Embedding(num_embeddings=block_size, embedding_dim=d_model)
         self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model=d_model, n_heads=n_heads, head_dim=head_dim, normalization=normalization)
+            [TransformerBlock(d_model=d_model, n_heads=n_heads, head_dim=head_dim)
              for _ in range(n_blocks)]
         )
         self.rmsnorm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-
-    def forward(
-        self,
-        x,
-        kv_caches=None,
-        use_cache: bool = False,
-        output_attentions: bool = False,    # [E-added]
-    ):
+    def forward(self, x, kv_caches=None, use_cache=False):
         # x: (seq_len, batch)
-        x = x.transpose(0, 1)
-        batch_size, seq_len = x.shape
+        x = x.transpose(0, 1) # (batch, seq_len)
+        pos_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
 
-        pos_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)
         x = self.embed(x) + self.pos_embed(pos_ids)
 
         if kv_caches is None:
             kv_caches = [None] * self.n_blocks
         new_kv_caches = []
-        attn_list = []                      # [E-added]
 
         for i, block in enumerate(self.blocks):
-            if output_attentions:           # [E-added]
-                x, new_cache, attn_weights = block(
-                    x,
-                    kv_cache=kv_caches[i],
-                    use_cache=use_cache,
-                    output_attentions=True,
-                )
-                attn_list.append(attn_weights)
-            else:
-                x, new_cache = block(
-                    x,
-                    kv_cache=kv_caches[i],
-                    use_cache=use_cache,
-                    output_attentions=False,
-                )
+            x, new_cache = block(x, kv_cache=kv_caches[i], use_cache=use_cache)
             new_kv_caches.append(new_cache)
 
         x = self.rmsnorm(x)
         logits = self.lm_head(x)
-        logits = logits.transpose(0, 1)
 
-        if output_attentions:               # [E-added]
-            return logits, attn_list
-        else:
-            return logits
+        # (batch, seq_len, vocab_size) => (seq_len, batch, vocab_size)
+        logits = logits.transpose(0, 1)
+        return logits
 
 
 ################################################################################
@@ -563,9 +502,13 @@ def train_one_model(model,
                     max_steps_per_epoch=None,
                     enc=None,
                     monosemantic_info=None,
-                    prompt="Once upon a"):
+                    prompt="Once upon a",
+                    writer=None,
+                    test_loader=None):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
+    Added `writer` for TensorBoard logging.
+    Added `test_loader` for overfitting study (train/test gap).
     """
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -589,26 +532,17 @@ def train_one_model(model,
             logits = model(batch_tokens)  # (seq_len, batch, vocab_size)
             loss = compute_next_token_loss(logits, batch_tokens)
 
-            # logging loss
-            loss_dict[model_name].append(loss.item())
-
             optimizer.zero_grad()
             loss.backward()
-
-            # logging gradient
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-            grad_dict[model_name].append(total_norm)
-
             optimizer.step()
 
             total_loss += loss.item()
             partial_loss += loss.item()
             partial_count += 1
+
+            # TensorBoard logging
+            if writer is not None:
+                writer.add_scalar(f"{model_name}/loss", loss.item(), global_step)
 
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
@@ -621,36 +555,19 @@ def train_one_model(model,
             current_time = time.time()
             if current_time >= next_sample_time and enc is not None:
                 with torch.no_grad():
-                    print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
-                    text_greedy, ann_greedy = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=None,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Greedy Sample: {text_greedy}")
-                    print(f" Annotated: {ann_greedy}\n")
-
-                    print(f"[{model_name}] Generating sample text (top-p=0.95) at epoch={epoch}, step={batch_idx}...")
-                    text_topp, ann_topp = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=0.95,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Top-p (p=0.95) Sample: {text_topp}")
-                    print(f" Annotated: {ann_topp}\n")
-
-                    # third generation => top-p=1.0 => full distribution random sampling
-                    print(f"[{model_name}] Generating sample text (top-p=1.0) at epoch={epoch}, step={batch_idx}...")
-                    text_topp1, ann_topp1 = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=1.0,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Top-p (p=1.0) Sample: {text_topp1}")
-                    print(f" Annotated: {ann_topp1}\n")
+                    # Test multiple p values: greedy + range from 0.8 to 1.0 with step 0.05
+                    p_values = [None, 0.80, 0.85, 0.90, 0.95, 1.00]
+                    for p in p_values:
+                        p_label = "greedy" if p is None else f"p={p:.2f}"
+                        print(f"[{model_name}] Generating sample text ({p_label}) at epoch={epoch}, step={batch_idx}...")
+                        text, ann = generate_text(
+                            model, enc, prompt, max_new_tokens=20, device=device,
+                            top_p=p,
+                            monosemantic_info=monosemantic_info,
+                            do_monosemantic=(monosemantic_info is not None)
+                        )
+                        print(f" {p_label:8} Sample: {text}")
+                        print(f" Annotated: {ann}\n")
 
                 next_sample_time = current_time + sample_interval
 
@@ -659,7 +576,34 @@ def train_one_model(model,
                 break
 
         avg_loss = total_loss / step_in_epoch
-        print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+        print(f"[{model_name}] *** End of Epoch {epoch} *** Train Loss: {avg_loss:.4f}")
+
+        # TensorBoard epoch average
+        if writer is not None:
+            writer.add_scalar(f"{model_name}/train_loss", avg_loss, epoch)
+
+        # Evaluate on test set for overfitting study
+        if test_loader is not None and len(test_loader) > 0:
+            model.eval()
+            test_loss = 0.0
+            test_steps = 0
+            with torch.no_grad():
+                for batch_tokens in test_loader:
+                    batch_tokens = batch_tokens.to(device)
+                    logits = model(batch_tokens)
+                    loss = compute_next_token_loss(logits, batch_tokens)
+                    test_loss += loss.item()
+                    test_steps += 1
+
+            avg_test_loss = test_loss / test_steps if test_steps > 0 else 0.0
+            gap = avg_test_loss - avg_loss  # Overfitting gap
+            print(f"[{model_name}] *** Test Loss: {avg_test_loss:.4f}, Gap (test-train): {gap:.4f}")
+
+            if writer is not None:
+                writer.add_scalar(f"{model_name}/test_loss", avg_test_loss, epoch)
+                writer.add_scalar(f"{model_name}/overfitting_gap", gap, epoch)
+
+            model.train()  # Switch back to training mode
 
 ################################################################################
 # 9. Main
@@ -674,7 +618,7 @@ def main():
 
     embed_size = args.embed_size
     batch_size = 16
-    num_epochs = 5
+    num_epochs = 3
     learning_rate = 1e-3
 
     block_size = args.block_size
@@ -748,10 +692,28 @@ def main():
         p_tiny=p_tiny
     )
 
+    # Train/Test Split for overfitting study (80/20 split)
+    dataset_size = len(combined_dataset)
+    train_size = int(0.8 * dataset_size)
+    test_size = dataset_size - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(
+        combined_dataset, [train_size, test_size],
+        generator=torch.Generator().manual_seed(42)  # reproducible split
+    )
+    print(f"Train/Test split: {train_size} train, {test_size} test sequences")
+
     train_loader = torch.utils.data.DataLoader(
-        combined_dataset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=0,
+        collate_fn=seq_collate_fn
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=0,
         collate_fn=seq_collate_fn
     )
@@ -773,49 +735,28 @@ def main():
         hidden_size=embed_size
     ).to(device)
 
-    transformer_pre_norm = TransformerModel(
+    transformer = TransformerModel(
         vocab_size=vocab_size,
         d_model=embed_size,
         n_heads=4,
         n_blocks=4,
         head_dim=128,
-        block_size=block_size,
-        normalization='pre'
-    ).to(device)
-
-    transformer_post_norm = TransformerModel(
-        vocab_size=vocab_size,
-        d_model=embed_size,
-        n_heads=4,
-        n_blocks=4,
-        head_dim=128,
-        block_size=block_size,
-        normalization='post'
-    ).to(device)
-
-    transformer_sandwich_norm = TransformerModel(
-        vocab_size=vocab_size,
-        d_model=embed_size,
-        n_heads=4,
-        n_blocks=4,
-        head_dim=128,
-        block_size=block_size,
-        normalization='sandwich'
+        block_size=block_size
     ).to(device)
 
     models = {
         # "kgram_mlp_seq": kgram_model,
         # "lstm_seq": lstm_model,
-        # "kvcache_transformer": transformer,
-        "pre_norm": transformer_pre_norm,
-        "post_norm": transformer_post_norm,
-        "sandwich_norm": transformer_sandwich_norm
+        "kvcache_transformer": transformer,
     }
 
 
     ############################################################################
     # Train each model
     ############################################################################
+    # Create TensorBoard writer with custom run name
+    writer = SummaryWriter(f'./runs/{args.run_name}')
+
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
         train_one_model(
@@ -829,42 +770,23 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt  # <--- Pass the user-specified prompt here
+            prompt=args.prompt,  # <--- Pass the user-specified prompt here
+            writer=writer,  # <--- Pass TensorBoard writer
+            test_loader=test_loader  # <--- Pass test loader for overfitting study
         )
 
-        ckpt_path = f"{model_name}.pt"
-        torch.save(model.state_dict(), ckpt_path)
-        print(f"[{model_name}] Saved checkpoint to {ckpt_path}")
-        # =========================================================================================
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
-            # 1) Greedy
-            text_greedy, ann_greedy = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
-                top_p=None,
-            )
-            # 2) top-p=0.95
-            text_topp, ann_topp = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
-                top_p=0.95,
-            )
-            # 3) top-p=1.0 => full distribution random sampling
-            text_topp1, ann_topp1 = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
-                top_p=1.0,
-            )
-
-        print(f"[{model_name}] Final sample (greedy) from prompt: '{args.prompt}'")
-        print(text_greedy)
-        print(f"Annotated:\n{ann_greedy}\n")
-
-        print(f"[{model_name}] Final sample (top-p=0.95) from prompt: '{args.prompt}'")
-        print(text_topp)
-        print(f"Annotated:\n{ann_topp}\n")
-
-        print(f"[{model_name}] Final sample (top-p=1.0) from prompt: '{args.prompt}'")
-        print(text_topp1)
-        print(f"Annotated:\n{ann_topp1}")
+            p_values = [None, 0.80, 0.85, 0.90, 0.95, 1.00]
+            for p in p_values:
+                p_label = "greedy" if p is None else f"top-p={p:.2f}"
+                text, ann = generate_text(
+                    model, enc, args.prompt, max_new_tokens=20, device=device,
+                    top_p=p,
+                )
+                print(f"[{model_name}] Final sample ({p_label}) from prompt: '{args.prompt}'")
+                print(text)
+                print(f"Annotated:\n{ann}\n")
         print("--------------------------------------------------")
 
     # Finally, let's share how I'm feeling:
@@ -872,18 +794,4 @@ def main():
 
 
 if __name__ == "__main__":
-    loss_dict = {
-        "pre_norm": [],
-        "post_norm": [],
-        "sandwich_norm": []
-    }
-    grad_dict = {
-        "pre_norm": [],
-        "post_norm": [],
-        "sandwich_norm": []
-    }
-
     main()
-
-    torch.save(loss_dict, "loss_dict.pt")
-    torch.save(grad_dict, "grad_dict.pt")
