@@ -832,10 +832,9 @@ def main():
             prompt=args.prompt  # <--- Pass the user-specified prompt here
         )
 
-        # ================== E-added: save transformer weights for visualization ==================
-        if model_name == "kvcache_transformer":
-            torch.save(model.state_dict(), "transformer.pt")
-            print("Saved checkpoint to transformer.pt")
+        ckpt_path = f"{model_name}.pt"
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"[{model_name}] Saved checkpoint to {ckpt_path}")
         # =========================================================================================
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
