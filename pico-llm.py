@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
@@ -52,6 +53,10 @@ def parse_args():
     # Newly added device argument:
     parser.add_argument("--device_id", type=str, default="cuda:0",
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
+
+    # TensorBoard run name for comparison experiments
+    parser.add_argument("--run_name", type=str, default="default",
+                        help="Name for this training run (used in TensorBoard directory). Default='default'.")
 
     args = parser.parse_args()
     return args
@@ -563,9 +568,13 @@ def train_one_model(model,
                     max_steps_per_epoch=None,
                     enc=None,
                     monosemantic_info=None,
-                    prompt="Once upon a"):
+                    prompt="Once upon a",
+                    writer=None,
+                    test_loader=None):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
+    Added `writer` for TensorBoard logging.
+    Added `test_loader` for overfitting study (train/test gap).
     """
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -610,6 +619,10 @@ def train_one_model(model,
             partial_loss += loss.item()
             partial_count += 1
 
+            # TensorBoard logging
+            if writer is not None:
+                writer.add_scalar(f"{model_name}/loss", loss.item(), global_step)
+
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
                 print(f"[{model_name}] Epoch {epoch}/{epochs}, "
@@ -621,36 +634,19 @@ def train_one_model(model,
             current_time = time.time()
             if current_time >= next_sample_time and enc is not None:
                 with torch.no_grad():
-                    print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
-                    text_greedy, ann_greedy = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=None,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Greedy Sample: {text_greedy}")
-                    print(f" Annotated: {ann_greedy}\n")
-
-                    print(f"[{model_name}] Generating sample text (top-p=0.95) at epoch={epoch}, step={batch_idx}...")
-                    text_topp, ann_topp = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=0.95,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Top-p (p=0.95) Sample: {text_topp}")
-                    print(f" Annotated: {ann_topp}\n")
-
-                    # third generation => top-p=1.0 => full distribution random sampling
-                    print(f"[{model_name}] Generating sample text (top-p=1.0) at epoch={epoch}, step={batch_idx}...")
-                    text_topp1, ann_topp1 = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=1.0,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Top-p (p=1.0) Sample: {text_topp1}")
-                    print(f" Annotated: {ann_topp1}\n")
+                    # Test multiple p values: greedy + range from 0.8 to 1.0 with step 0.05
+                    p_values = [None, 0.80, 0.85, 0.90, 0.95, 1.00]
+                    for p in p_values:
+                        p_label = "greedy" if p is None else f"p={p:.2f}"
+                        print(f"[{model_name}] Generating sample text ({p_label}) at epoch={epoch}, step={batch_idx}...")
+                        text, ann = generate_text(
+                            model, enc, prompt, max_new_tokens=20, device=device,
+                            top_p=p,
+                            monosemantic_info=monosemantic_info,
+                            do_monosemantic=(monosemantic_info is not None)
+                        )
+                        print(f" {p_label:8} Sample: {text}")
+                        print(f" Annotated: {ann}\n")
 
                 next_sample_time = current_time + sample_interval
 
@@ -659,7 +655,34 @@ def train_one_model(model,
                 break
 
         avg_loss = total_loss / step_in_epoch
-        print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+        print(f"[{model_name}] *** End of Epoch {epoch} *** Train Loss: {avg_loss:.4f}")
+
+        # TensorBoard epoch average
+        if writer is not None:
+            writer.add_scalar(f"{model_name}/train_loss", avg_loss, epoch)
+
+        # Evaluate on test set for overfitting study
+        if test_loader is not None and len(test_loader) > 0:
+            model.eval()
+            test_loss = 0.0
+            test_steps = 0
+            with torch.no_grad():
+                for batch_tokens in test_loader:
+                    batch_tokens = batch_tokens.to(device)
+                    logits = model(batch_tokens)
+                    loss = compute_next_token_loss(logits, batch_tokens)
+                    test_loss += loss.item()
+                    test_steps += 1
+
+            avg_test_loss = test_loss / test_steps if test_steps > 0 else 0.0
+            gap = avg_test_loss - avg_loss  # Overfitting gap
+            print(f"[{model_name}] *** Test Loss: {avg_test_loss:.4f}, Gap (test-train): {gap:.4f}")
+
+            if writer is not None:
+                writer.add_scalar(f"{model_name}/test_loss", avg_test_loss, epoch)
+                writer.add_scalar(f"{model_name}/overfitting_gap", gap, epoch)
+
+            model.train()  # Switch back to training mode
 
 ################################################################################
 # 9. Main
@@ -748,10 +771,28 @@ def main():
         p_tiny=p_tiny
     )
 
+    # Train/Test Split for overfitting study (80/20 split)
+    dataset_size = len(combined_dataset)
+    train_size = int(0.8 * dataset_size)
+    test_size = dataset_size - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(
+        combined_dataset, [train_size, test_size],
+        generator=torch.Generator().manual_seed(42)  # reproducible split
+    )
+    print(f"Train/Test split: {train_size} train, {test_size} test sequences")
+
     train_loader = torch.utils.data.DataLoader(
-        combined_dataset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=0,
+        collate_fn=seq_collate_fn
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=0,
         collate_fn=seq_collate_fn
     )
@@ -816,6 +857,9 @@ def main():
     ############################################################################
     # Train each model
     ############################################################################
+    # Create TensorBoard writer with custom run name
+    writer = SummaryWriter(f'./runs/{args.run_name}')
+
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
         train_one_model(
@@ -829,7 +873,9 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt  # <--- Pass the user-specified prompt here
+            prompt=args.prompt,  # <--- Pass the user-specified prompt here
+            writer=writer,  # <--- Pass TensorBoard writer
+            test_loader=test_loader  # <--- Pass test loader for overfitting study
         )
 
         ckpt_path = f"{model_name}.pt"
@@ -838,33 +884,16 @@ def main():
         # =========================================================================================
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
-            # 1) Greedy
-            text_greedy, ann_greedy = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
-                top_p=None,
-            )
-            # 2) top-p=0.95
-            text_topp, ann_topp = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
-                top_p=0.95,
-            )
-            # 3) top-p=1.0 => full distribution random sampling
-            text_topp1, ann_topp1 = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
-                top_p=1.0,
-            )
-
-        print(f"[{model_name}] Final sample (greedy) from prompt: '{args.prompt}'")
-        print(text_greedy)
-        print(f"Annotated:\n{ann_greedy}\n")
-
-        print(f"[{model_name}] Final sample (top-p=0.95) from prompt: '{args.prompt}'")
-        print(text_topp)
-        print(f"Annotated:\n{ann_topp}\n")
-
-        print(f"[{model_name}] Final sample (top-p=1.0) from prompt: '{args.prompt}'")
-        print(text_topp1)
-        print(f"Annotated:\n{ann_topp1}")
+            p_values = [None, 0.80, 0.85, 0.90, 0.95, 1.00]
+            for p in p_values:
+                p_label = "greedy" if p is None else f"top-p={p:.2f}"
+                text, ann = generate_text(
+                    model, enc, args.prompt, max_new_tokens=20, device=device,
+                    top_p=p,
+                )
+                print(f"[{model_name}] Final sample ({p_label}) from prompt: '{args.prompt}'")
+                print(text)
+                print(f"Annotated:\n{ann}\n")
         print("--------------------------------------------------")
 
     # Finally, let's share how I'm feeling:
